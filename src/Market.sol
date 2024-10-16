@@ -11,12 +11,23 @@ interface IFlashLoanReceiver {
 }
 
 contract Market is ReentrancyGuard {
+    using SafeMath for uint256;
+
     address public lendingAsset;
     address public borrowingAsset;
-    uint256 public interestRate;
     uint256 public collateralRatio;
     uint256 public constant FLASH_LOAN_FEE = 9; // 0.09% fee
     uint256 public constant FLASH_LOAN_FEE_PRECISION = 10000;
+
+    // Interest rate model parameters
+    uint256 public constant OPTIMAL_UTILIZATION = 80; // 80%
+    uint256 public constant BASE_RATE = 0; // 0%
+    uint256 public constant SLOPE1 = 4; // 4%
+    uint256 public constant SLOPE2 = 75; // 75%
+    uint256 public constant UTILIZATION_PRECISION = 100;
+
+    uint256 public totalDeposits;
+    uint256 public totalBorrows;
 
     mapping(address => uint256) public deposits;
     mapping(address => uint256) public borrows;
@@ -41,26 +52,27 @@ contract Market is ReentrancyGuard {
     event Liquidated(address indexed borrower, address indexed liquidator, uint256 amount);
     event FlashLoan(address indexed receiver, address indexed asset, uint256 amount, uint256 fee);
 
-    constructor(address _lendingAsset, address _borrowingAsset, uint256 _interestRate, uint256 _collateralRatio) {
+    constructor(address _lendingAsset, address _borrowingAsset, uint256 _collateralRatio) {
         lendingAsset = _lendingAsset;
         borrowingAsset = _borrowingAsset;
-        interestRate = _interestRate;
         collateralRatio = _collateralRatio;
     }
 
     function deposit(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
         IERC20(lendingAsset).transferFrom(msg.sender, address(this), amount);
-        deposits[msg.sender] += amount;
+        deposits[msg.sender] = deposits[msg.sender].add(amount);
+        totalDeposits = totalDeposits.add(amount);
         emit Deposited(msg.sender, amount);
     }
 
     function borrow(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        uint256 requiredCollateral = (amount * collateralRatio) / 100;
+        uint256 requiredCollateral = amount.mul(collateralRatio).div(100);
         if (deposits[msg.sender] < requiredCollateral) revert InsufficientCollateral();
 
-        borrows[msg.sender] += amount;
+        borrows[msg.sender] = borrows[msg.sender].add(amount);
+        totalBorrows = totalBorrows.add(amount);
         IERC20(borrowingAsset).transfer(msg.sender, amount);
         emit Borrowed(msg.sender, amount);
     }
@@ -70,7 +82,8 @@ contract Market is ReentrancyGuard {
         if (borrows[msg.sender] < amount) revert RepayAmountExceedsBorrowed();
 
         IERC20(borrowingAsset).transferFrom(msg.sender, address(this), amount);
-        borrows[msg.sender] -= amount;
+        borrows[msg.sender] = borrows[msg.sender].sub(amount);
+        totalBorrows = totalBorrows.sub(amount);
         emit Repaid(msg.sender, amount);
     }
 
@@ -79,10 +92,11 @@ contract Market is ReentrancyGuard {
         if (deposits[msg.sender] < amount) revert InsufficientBalance();
 
         uint256 borrowedAmount = borrows[msg.sender];
-        uint256 requiredCollateral = (borrowedAmount * collateralRatio) / 100;
-        if (deposits[msg.sender] - amount < requiredCollateral) revert WithdrawalLeavesInsufficientCollateral();
+        uint256 requiredCollateral = borrowedAmount.mul(collateralRatio).div(100);
+        if (deposits[msg.sender].sub(amount) < requiredCollateral) revert WithdrawalLeavesInsufficientCollateral();
 
-        deposits[msg.sender] -= amount;
+        deposits[msg.sender] = deposits[msg.sender].sub(amount);
+        totalDeposits = totalDeposits.sub(amount);
         IERC20(lendingAsset).transfer(msg.sender, amount);
         emit Withdrawn(msg.sender, amount);
     }
@@ -90,7 +104,7 @@ contract Market is ReentrancyGuard {
     function liquidate(address borrower) external nonReentrant {
         uint256 borrowedAmount = borrows[borrower];
         uint256 collateralValue = deposits[borrower];
-        uint256 requiredCollateral = (borrowedAmount * collateralRatio) / 100;
+        uint256 requiredCollateral = borrowedAmount.mul(collateralRatio).div(100);
 
         if (collateralValue >= requiredCollateral) revert PositionNotUndercollateralized();
 
@@ -106,6 +120,8 @@ contract Market is ReentrancyGuard {
         // Clear the borrower's position
         borrows[borrower] = 0;
         deposits[borrower] = 0;
+        totalBorrows = totalBorrows.sub(borrowedAmount);
+        totalDeposits = totalDeposits.sub(collateralValue);
 
         emit Liquidated(borrower, msg.sender, amountToLiquidate);
     }
@@ -115,7 +131,7 @@ contract Market is ReentrancyGuard {
         uint256 balanceBefore = IERC20(asset).balanceOf(address(this));
         if (balanceBefore < amount) revert InsufficientLiquidity();
 
-        uint256 fee = (amount * FLASH_LOAN_FEE) / FLASH_LOAN_FEE_PRECISION;
+        uint256 fee = amount.mul(FLASH_LOAN_FEE).div(FLASH_LOAN_FEE_PRECISION);
 
         IERC20(asset).transfer(receiver, amount);
 
@@ -123,8 +139,32 @@ contract Market is ReentrancyGuard {
         if (!success) revert FlashLoanRepaymentFailed();
 
         uint256 balanceAfter = IERC20(asset).balanceOf(address(this));
-        if (balanceAfter < balanceBefore + fee) revert FlashLoanNotRepaid();
+        if (balanceAfter < balanceBefore.add(fee)) revert FlashLoanNotRepaid();
 
         emit FlashLoan(receiver, asset, amount, fee);
+    }
+
+    // New functions for the interest rate model
+
+    function getUtilizationRate() public view returns (uint256) {
+        if (totalDeposits == 0) return 0;
+        return totalBorrows.mul(UTILIZATION_PRECISION).div(totalDeposits);
+    }
+
+    function getBorrowRate() public view returns (uint256) {
+        uint256 utilization = getUtilizationRate();
+        if (utilization <= OPTIMAL_UTILIZATION) {
+            return BASE_RATE.add(utilization.mul(SLOPE1).div(OPTIMAL_UTILIZATION));
+        } else {
+            return BASE_RATE.add(SLOPE1).add(
+                (utilization.sub(OPTIMAL_UTILIZATION)).mul(SLOPE2).div(UTILIZATION_PRECISION.sub(OPTIMAL_UTILIZATION))
+            );
+        }
+    }
+
+    function getSupplyRate() public view returns (uint256) {
+        uint256 utilizationRate = getUtilizationRate();
+        uint256 borrowRate = getBorrowRate();
+        return utilizationRate.mul(borrowRate).div(UTILIZATION_PRECISION);
     }
 }
